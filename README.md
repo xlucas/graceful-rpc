@@ -1,45 +1,47 @@
-# The Go Programming Language
+# RPC
 
-Go is an open source programming language that makes it easy to build simple,
-reliable, and efficient software.
+A fork of the `net/rpc` package that implements graceful shutdown.
 
-![Gopher image](doc/gopher/fiveyears.jpg)
-*Gopher image by [Renee French][rf], licensed under [Creative Commons 3.0 Attributions license][cc3-by].*
+## Why ?
 
-Our canonical Git repository is located at https://go.googlesource.com/go.
-There is a mirror of the repository at https://github.com/golang/go.
+The `net/rpc` package has some interesting features, it notably doesn't rely on
+an IDL and is really fast. But it lacks a graceful shutdown implementation like
+`net/http`.
 
-Unless otherwise noted, the Go source files are distributed under the
-BSD-style license found in the LICENSE file.
+Multiple third party packages try to provide shutdown capabilities by bringing
+control over the server's `net.Listener` and relying on a shutdown event the
+user handles in his application. This is not a viable approach: the user is not
+given a way to drain connections and in-flight requests are eventually killed.
 
-### Download and Install
+This package implements a mechanism similar to `net/http` to bring a proper
+graceful shutdown feature by tracking connections and polling their state.
 
-#### Binary Distributions
+## Usage
 
-Official binary distributions are available at https://golang.org/dl/.
+```go
+rpc.Register(new(MyInterface))
+rpc.HandleHTTP()
 
-After downloading a binary release, visit https://golang.org/doc/install
-or load doc/install.html in your web browser for installation
-instructions.
+l, err := net.Listen("tcp", ":1234")
+if err != nil {
+    log.Fatal("listen error:", err)
+}
 
-#### Install From Source
+go func() {
+    if err := http.Serve(l, nil); err != nil && err != rpc.ErrServerClosed {
+        log.Fatal("serve error:", err)
+    }
+}()
 
-If a binary distribution is not available for your combination of
-operating system and architecture, visit
-https://golang.org/doc/install/source or load doc/install-source.html
-in your web browser for source installation instructions.
+...
 
-### Contributing
+// This will close all active listeners then wait for all RPC calls to finish
+// before releasing connections and returning.
+if err = rpc.Shutdown(context.Background()); err != nil {
+    log.Fatal("shutdown error:", err)
+}
+```
 
-Go is the work of hundreds of contributors. We appreciate your help!
+## License
 
-To contribute, please read the contribution guidelines:
-	https://golang.org/doc/contribute.html
-
-Note that the Go project does not use GitHub pull requests, and that
-we use the issue tracker for bug reports and proposals only. See
-https://golang.org/wiki/Questions for a list of places to ask
-questions about the Go language.
-
-[rf]: https://reneefrench.blogspot.com/
-[cc3-by]: https://creativecommons.org/licenses/by/3.0/
+This project's inherits the golang project license.
