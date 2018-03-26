@@ -399,6 +399,10 @@ type CodecEmulator struct {
 	err           error
 }
 
+func (codec *CodecEmulator) Conn() net.Conn {
+	return nil
+}
+
 func (codec *CodecEmulator) Call(serviceMethod string, args *Args, reply *Reply) error {
 	codec.serviceMethod = serviceMethod
 	codec.args = args

@@ -128,6 +128,7 @@ package rpc
 
 import (
 	"bufio"
+	"context"
 	"encoding/gob"
 	"errors"
 	"io"
@@ -137,6 +138,8 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 	"unicode"
 	"unicode/utf8"
 )
@@ -185,18 +188,65 @@ type Response struct {
 	next          *Response // for free list in Server
 }
 
+// The state of a tracked object.
+type trackState int
+
+const (
+	tracked trackState = iota
+	untracked
+)
+
+// conn represents the server side of an RPC connection.
+type conn struct {
+	numActiveReq int32
+	rwc          net.Conn
+}
+
+// newConn creates a new connection from a net.Conn.
+func newConn(c net.Conn) *conn {
+	return &conn{rwc: c}
+}
+
+func (c *conn) incrNumReq() {
+	atomic.AddInt32(&c.numActiveReq, 1)
+}
+
+func (c *conn) decrNumReq() {
+	atomic.AddInt32(&c.numActiveReq, -1)
+}
+
+func (c *conn) numReq() int32 {
+	return atomic.LoadInt32(&c.numActiveReq)
+}
+
+// ErrServerClosed is returned by the Server's Serve method after a call to
+// Shutdown or Close.
+var ErrServerClosed = errors.New("Server is shut down")
+
 // Server represents an RPC Server.
 type Server struct {
+	listeners  map[net.Listener]struct{}
 	serviceMap sync.Map   // map[string]*service
 	reqLock    sync.Mutex // protects freeReq
 	freeReq    *Request
 	respLock   sync.Mutex // protects freeResp
 	freeResp   *Response
+	mu         sync.Mutex
+	conns      map[*conn]struct{}
+	inShutdown atomic.Value
 }
 
 // NewServer returns a new Server.
 func NewServer() *Server {
 	return &Server{}
+}
+
+func (server *Server) shuttingDown() bool {
+	return server.inShutdown.Load().(bool)
+}
+
+func (server *Server) setShutdown(v bool) {
+	server.inShutdown.Store(v)
 }
 
 // DefaultServer is the default instance of *Server.
@@ -372,7 +422,9 @@ func (m *methodType) NumCalls() (n uint) {
 	return n
 }
 
-func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec) {
+func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec, conn *conn) {
+	// decrement request counter when we are done
+	defer conn.decrNumReq()
 	mtype.Lock()
 	mtype.numCalls++
 	mtype.Unlock()
@@ -427,6 +479,9 @@ func (c *gobServerCodec) WriteResponse(r *Response, body interface{}) (err error
 	return c.encBuf.Flush()
 }
 
+func (c *gobServerCodec) Conn() net.Conn {
+	return c.rwc.(net.Conn)
+}
 func (c *gobServerCodec) Close() error {
 	if c.closed {
 		// Only call c.rwc.Close once; otherwise the semantics are undefined.
@@ -455,9 +510,11 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 // ServeCodec is like ServeConn but uses the specified codec to
 // decode requests and encode responses.
 func (server *Server) ServeCodec(codec ServerCodec) {
+	conn := newConn(codec.Conn())
+	server.trackConn(conn, tracked, true)
 	sending := new(sync.Mutex)
 	for {
-		service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec)
+		service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec, conn)
 		if err != nil {
 			if debugLog && err != io.EOF {
 				log.Println("rpc:", err)
@@ -470,19 +527,25 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 				server.sendResponse(sending, req, invalidRequest, codec, err.Error())
 				server.freeRequest(req)
 			}
+			conn.decrNumReq()
 			continue
 		}
-		go service.call(server, sending, mtype, req, argv, replyv, codec)
+		go service.call(server, sending, mtype, req, argv, replyv, codec, conn)
 	}
+
 	codec.Close()
+	server.trackConn(conn, untracked, true)
 }
 
 // ServeRequest is like ServeCodec but synchronously serves a single request.
 // It does not close the codec upon completion.
 func (server *Server) ServeRequest(codec ServerCodec) error {
+	conn := newConn(codec.Conn())
+	server.trackConn(conn, tracked, true)
 	sending := new(sync.Mutex)
-	service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec)
+	service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec, conn)
 	if err != nil {
+		defer conn.decrNumReq()
 		if !keepReading {
 			return err
 		}
@@ -493,7 +556,7 @@ func (server *Server) ServeRequest(codec ServerCodec) error {
 		}
 		return err
 	}
-	service.call(server, sending, mtype, req, argv, replyv, codec)
+	service.call(server, sending, mtype, req, argv, replyv, codec, conn)
 	return nil
 }
 
@@ -537,8 +600,9 @@ func (server *Server) freeResponse(resp *Response) {
 	server.respLock.Unlock()
 }
 
-func (server *Server) readRequest(codec ServerCodec) (service *service, mtype *methodType, req *Request, argv, replyv reflect.Value, keepReading bool, err error) {
+func (server *Server) readRequest(codec ServerCodec, conn *conn) (service *service, mtype *methodType, req *Request, argv, replyv reflect.Value, keepReading bool, err error) {
 	service, mtype, req, keepReading, err = server.readRequestHeader(codec)
+	conn.incrNumReq()
 	if err != nil {
 		if !keepReading {
 			return
@@ -650,9 +714,17 @@ type ServerCodec interface {
 	ReadRequestBody(interface{}) error
 	// WriteResponse must be safe for concurrent use by multiple goroutines.
 	WriteResponse(*Response, interface{}) error
-
+	Conn() net.Conn
 	Close() error
 }
+
+// Serve accepts connections on the listener and serves requests with
+// DefaultServer for each incoming connection.
+// Serve blocks; the caller typically invokes it in a go statement.
+//
+// Serve always return a non-nil error. After Shutdown or Close, the returned
+// error is ErrServerClosed.
+func Serve(lis net.Listener) error { return DefaultServer.Serve(lis) }
 
 // ServeConn runs the DefaultServer on a single connection.
 // ServeConn blocks, serving the connection until the client hangs up.
@@ -700,6 +772,143 @@ func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	server.ServeConn(conn)
 }
 
+// Serve accepts connections on the listener and serves requests for each
+// incoming connection.
+// Serve blocks; the caller typically invokes it in a go statement.
+//
+// Serve always return a non-nil error. After Shutdown or Close, the returned
+// error is ErrServerClosed.
+func (server *Server) Serve(lis net.Listener) error {
+	defer lis.Close()
+	server.trackListener(lis, tracked)
+	defer server.trackListener(lis, untracked)
+
+	for {
+		rwc, err := lis.Accept()
+		if err != nil {
+			if server.shuttingDown() {
+				server.setShutdown(false)
+				return ErrServerClosed
+			}
+			return err
+		}
+		go server.ServeConn(rwc)
+	}
+}
+
+// trackConn changes the tracking state of a conn.
+func (server *Server) trackConn(c *conn, st trackState, lock bool) {
+	if lock {
+		server.mu.Lock()
+		defer server.mu.Unlock()
+	}
+	if server.conns == nil {
+		server.conns = make(map[*conn]struct{})
+	}
+
+	switch st {
+	case tracked:
+		server.conns[c] = struct{}{}
+	case untracked:
+		delete(server.conns, c)
+	default:
+		panic("invalid track state")
+	}
+
+	return
+}
+
+// trackListener changes the tracking state of a net.Listener.
+func (server *Server) trackListener(lis net.Listener, st trackState) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if server.listeners == nil {
+		server.listeners = make(map[net.Listener]struct{})
+	}
+
+	switch st {
+	case tracked:
+		server.listeners[lis] = struct{}{}
+	case untracked:
+		delete(server.listeners, lis)
+	default:
+		panic("invalid track state")
+	}
+
+	return
+}
+
+// shutdownPollingInterval is used to poll the server state during shutdown.
+var shutdownPollingInterval = 250 * time.Millisecond
+
+// Shutdown gracefully shuts down the server without interrupting any active
+// connection. Shutdown works by first closing all open listeners, then waiting
+// indefinitely for connections to transition to an idle state before closing
+// them and shutting down. If the provided context expires before the shutdown
+// is complete, Shutdown returns the context's error, otherwise it returns any
+// error returned from closing the Server's underlying Listener(s).
+func (server *Server) Shutdown(ctx context.Context) error {
+	server.setShutdown(true)
+	err := server.closeListeners()
+
+	ticker := time.NewTicker(shutdownPollingInterval)
+	defer ticker.Stop()
+	for {
+		if server.closeConns(false) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// Close immediately closes all active net.Listeners and all connections.
+// For a graceful shutdown, use Shutdown.
+//
+// Close returns any error returned from closing the Server's underlying
+// Listener(s).
+func (server *Server) Close() error {
+	server.setShutdown(true)
+	err := server.closeListeners()
+	server.closeConns(true)
+	return err
+}
+
+// closeListeners closes all listeners. If one or more errors occur, the last
+// one will be returned.
+func (server *Server) closeListeners() (err error) {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	for ln := range server.listeners {
+		if cerr := ln.Close(); err != nil {
+			err = cerr
+		}
+		delete(server.listeners, ln)
+	}
+	return err
+}
+
+// closeConns closes all connections and report wether the server is quiescent.
+// If force close is requested all connections are closed immediately. If not,
+// only connections with no request being processed will be closed.
+func (server *Server) closeConns(force bool) bool {
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	quiescent := true
+	for conn := range server.conns {
+		if conn.numReq() == 0 || force {
+			conn.rwc.Close()
+			server.trackConn(conn, untracked, false)
+		} else {
+			quiescent = false
+		}
+	}
+	return quiescent
+}
+
 // HandleHTTP registers an HTTP handler for RPC messages on rpcPath,
 // and a debugging handler on debugPath.
 // It is still necessary to invoke http.Serve(), typically in a go statement.
@@ -713,4 +922,24 @@ func (server *Server) HandleHTTP(rpcPath, debugPath string) {
 // It is still necessary to invoke http.Serve(), typically in a go statement.
 func HandleHTTP() {
 	DefaultServer.HandleHTTP(DefaultRPCPath, DefaultDebugPath)
+}
+
+// Shutdown gracefully shuts down the DefaultServer without interrupting any
+// active connection. Shutdown works by first closing all DefaultServer's
+// open listeners, then waiting indefinitely for connections to transition to
+// an idle state before closing them and shutting down. If the provided context
+// expires before the shutdown is complete, Shutdown forcibly closes active
+// connections and returns the context's error, otherwise it returns any error
+// returned from closing the DefaultServer's underlying Listener(s).
+func Shutdown(ctx context.Context) error {
+	return DefaultServer.Shutdown(ctx)
+}
+
+// Close immediately closes DefaultServer's open listeners and all connections.
+// For a graceful shutdown use Shutdown.
+//
+// Close returns any error returned from closing the DefaultServer's
+// Listener(s).
+func Close() error {
+	return DefaultServer.Close()
 }
