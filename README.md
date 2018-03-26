@@ -1,4 +1,4 @@
-# RPC
+# graceful-rpc
 
 A fork of the `net/rpc` package that implements graceful shutdown.
 

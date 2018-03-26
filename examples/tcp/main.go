@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"stash.ovh.net/playground/rpc"
+	"stash.ovh.net/playground/graceful-rpc/rpc"
 )
 
 var clientLogger = log.New(os.Stdout, "client|", log.Ldate|log.Ltime|log.LUTC|log.Lshortfile)
@@ -20,7 +20,7 @@ type Args struct {
 
 type Operations struct{}
 
-func (op *Operations) Long(args *Args, reply *int) error {
+func (op *Operations) LongAdd(args *Args, reply *int) error {
 	defer serverLogger.Print("leaving RPC method")
 	serverLogger.Print("entering RPC method")
 	time.Sleep(5 * time.Second)
@@ -41,8 +41,6 @@ func main() {
 		serverLogger.Fatalf("unable to register methods: %s", err)
 	}
 
-	rpc.HandleHTTP()
-
 	lis, err := net.Listen("tcp", ":5000")
 	if err != nil {
 		serverLogger.Fatalf("unable to listen: %s", err)
@@ -62,7 +60,7 @@ func main() {
 	// Call a server's long-running operation
 	go func() {
 		clientLogger.Print("calling RPC method")
-		err := client.Call("Operations.Long", &Args{A: 1, B: 2}, &result)
+		err := client.Call("Operations.LongAdd", &Args{A: 1, B: 2}, &result)
 		if err != nil {
 			clientLogger.Fatalf("operation error: %s", err)
 		}
