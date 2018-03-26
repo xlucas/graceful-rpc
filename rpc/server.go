@@ -422,7 +422,10 @@ func (m *methodType) NumCalls() (n uint) {
 	return n
 }
 
-func (s *service) call(server *Server, sending *sync.Mutex, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec, conn *conn) {
+func (s *service) call(server *Server, sending *sync.Mutex, wg *sync.WaitGroup, mtype *methodType, req *Request, argv, replyv reflect.Value, codec ServerCodec, conn *conn) {
+	if wg != nil {
+		defer wg.Done()
+	}
 	// decrement request counter when we are done
 	defer conn.decrNumReq()
 	mtype.Lock()
@@ -513,6 +516,7 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 	conn := newConn(codec.Conn())
 	server.trackConn(conn, tracked, true)
 	sending := new(sync.Mutex)
+	wg := new(sync.WaitGroup)
 	for {
 		service, mtype, req, argv, replyv, keepReading, err := server.readRequest(codec, conn)
 		if err != nil {
@@ -530,9 +534,13 @@ func (server *Server) ServeCodec(codec ServerCodec) {
 			conn.decrNumReq()
 			continue
 		}
-		go service.call(server, sending, mtype, req, argv, replyv, codec, conn)
+		wg.Add(1)
+		go service.call(server, sending, wg, mtype, req, argv, replyv, codec, conn)
 	}
 
+	// We've seen that there are no more requests.
+	// Wait for responses to be sent before closing codec.
+	wg.Wait()
 	codec.Close()
 	server.trackConn(conn, untracked, true)
 }
@@ -556,7 +564,7 @@ func (server *Server) ServeRequest(codec ServerCodec) error {
 		}
 		return err
 	}
-	service.call(server, sending, mtype, req, argv, replyv, codec, conn)
+	service.call(server, sending, nil, mtype, req, argv, replyv, codec, conn)
 	return nil
 }
 
